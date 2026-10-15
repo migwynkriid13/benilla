@@ -128,6 +128,9 @@ pub(crate) struct NamePlates {
     by_frame: std::collections::HashMap<FrameHandle, usize>,
     /// World-render shows after the WORLD batch build; these plates join the next UI tick.
     pending_paint: std::collections::HashSet<FrameHandle>,
+    /// Plates this sync hid while they were in the built batch: re-shown in the same pass, they
+    /// still draw from the records the batch copied (`0x772fd0`).
+    retired_in_batch: std::collections::HashSet<FrameHandle>,
     /// Completed clicks, drained by [`UiScript::take_nameplate_clicks`].
     clicks: Vec<NamePlateClick>,
     /// The hit-test veto (`0x7cba30`). Not the mouse-enabled bit: it leaves `IsMouseEnabled()`
@@ -368,6 +371,7 @@ fn sync(
     let relayout = model.nameplates.geometry != Some(geometry);
     model.nameplates.geometry = Some(geometry);
 
+    model.nameplates.retired_in_batch.clear();
     // Retire first, so a departing unit's slot is free for an arriving one, as the reference
     // destroys then creates through one free list in the same tick.
     let gone: Vec<u64> = model
@@ -650,7 +654,9 @@ impl Plate {
 
         if last.is_none() {
             // WORLD batches precede the world callback's allocations (`0x765896`, `0x7658e2`).
-            model.nameplates.pending_paint.insert(frame);
+            if !model.nameplates.retired_in_batch.contains(&frame) {
+                model.nameplates.pending_paint.insert(frame);
+            }
             effects.visibility.push((frame, true));
         }
         if last.as_ref().is_none_or(|l| l.alpha != state.alpha) {
@@ -756,7 +762,9 @@ impl Plate {
             return;
         }
         let frame = model.nameplates.plates[i].frame;
-        model.nameplates.pending_paint.remove(&frame);
+        if !model.nameplates.pending_paint.remove(&frame) {
+            model.nameplates.retired_in_batch.insert(frame);
+        }
         effects.visibility.push((frame, false));
         model.nameplates.plates[i].last = None;
     }

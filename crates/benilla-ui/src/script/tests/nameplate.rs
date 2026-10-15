@@ -1038,3 +1038,23 @@ fn a_pending_plates_scroll_child_uses_the_callback_stratum() {
     assert!(texture_paths(&s).iter().any(|p| p == "ScrollChildArt"));
     assert!(s.take_errors().is_empty());
 }
+
+/// A plate hidden and re-shown in one world pass keeps the records its batch copied
+/// (`0x772fd0`), so a unit taking a drawn plate's slot draws in that frame.
+#[test]
+fn a_slot_retired_and_retaken_in_one_sync_draws_at_once() {
+    let mut s = vm();
+    drive(&mut s, &[plate("Wolf", 30.0, 40.0)]);
+    s.tick(0.0);
+    drive(&mut s, &[plate("Bear", 10.0, 90.0)]);
+    let texts: Vec<String> = s
+        .extract()
+        .into_iter()
+        .filter_map(|q| match q.content {
+            crate::script::QuadContent::Text { text, .. } => text,
+            _ => None,
+        })
+        .collect();
+    assert!(texts.iter().any(|t| t == "Bear"), "{texts:?}");
+    assert!(s.take_errors().is_empty());
+}
