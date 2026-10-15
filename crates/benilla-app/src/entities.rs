@@ -399,6 +399,17 @@ impl Creatures {
             animations: dm.animations.as_ref(),
         })
     }
+
+    /// A built unit's M2, whose camera table a `PlayerModel:SetCamera` reads (`0x76cec0`).
+    pub(crate) fn display_model(
+        &self,
+        display_id: u32,
+    ) -> Option<&Handle<benilla_assets::M2Model>> {
+        match &self.models.get(&display_id)?.handle {
+            ModelHandle::M2(model) => Some(model),
+            _ => None,
+        }
+    }
 }
 
 /// The skeleton/animation surface the portrait booth poses a bake with ([`Creatures::display_rig`]).

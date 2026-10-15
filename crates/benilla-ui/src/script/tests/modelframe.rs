@@ -110,8 +110,7 @@ fn a_player_model_is_a_model_plus_three_and_the_chain_runs_one_way() {
         "one slot: SetFacing overwrites what SetRotation wrote"
     );
 
-    // `RefreshUnit` is a no-op, as the pane resolves its unit token at render; stock
-    // `PaperDollFrame.xml:221` calls it.
+    // Stock `PaperDollFrame.xml:221` refreshes the copy of its stored unit GUID.
     assert!(s.run("PMPane:RefreshUnit()").is_ok());
 
     // `ClearModel`, reached through the chain, empties both content slots.
@@ -510,4 +509,399 @@ fn the_fog_block_arms_on_colour_and_clears_only_its_bit() {
     // The Lua setters store raw, with no clamp or ordering check; only the XML path clamps at 0.
     s.run("MFog:SetFogNear(-40) MFog:SetFogFar(-1)").unwrap();
     assert_eq!(fog(&s), (false, -40.0, -1.0));
+}
+
+fn unit_facts() -> crate::widget::ModelFileFacts {
+    crate::widget::ModelFileFacts {
+        sequences: vec![crate::widget::SequenceFacts {
+            anim_id: 0,
+            duration_ms: 1000,
+            looping: true,
+        }],
+        bbox: ([0.0; 3], [0.05, 0.1, 0.2]),
+        cameras: 2,
+    }
+}
+
+/// The reference stores a GUID (`0x505b50`); a later target change cannot rebind an existing copy.
+#[test]
+fn anonymous_unit_models_capture_native_token_identity_and_refresh_the_same_subject() {
+    use crate::script::UnitGuids;
+
+    const TARGET: u64 = 0xF130_0000_0000_0001;
+    const NEXT: u64 = 0xF130_0000_0000_0002;
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        target: TARGET,
+        held: [(TARGET, NEXT)].into_iter().collect(),
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        a = CreateFrame("PlayerModel")
+        a:SetWidth(90) a:SetHeight(90) a:SetPoint("CENTER", 0, 0)
+        a:SetUnit("TaRgEt")
+        b = CreateFrame("PlayerModel")
+        b:SetWidth(45) b:SetHeight(45) b:SetPoint("CENTER", 0, 0)
+        b:SetUnit("targettarget")
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    let first = s.visible_unit_model_panes();
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|p| p.name.is_none()));
+    assert_eq!((first[0].guid, first[1].guid), (TARGET, NEXT));
+    assert_ne!(first[0].handle, first[1].handle);
+    assert_ne!(first[0].instance, first[1].instance);
+
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        target: NEXT,
+        ..Default::default()
+    });
+    assert_eq!(s.visible_unit_model_panes()[0].guid, TARGET);
+    s.run("a:RefreshUnit()").unwrap();
+    let refreshed = s.visible_unit_model_panes();
+    assert_eq!(refreshed[0].guid, TARGET);
+    assert_ne!(refreshed[0].instance, first[0].instance);
+    s.run("a:SetUnit(\"target\")").unwrap();
+    assert_eq!(s.visible_unit_model_panes()[0].guid, NEXT);
+    s.run("a:ClearModel() b:SetUnit(nil)").unwrap();
+    assert!(s.visible_unit_model_panes().is_empty());
+}
+
+/// Streaming completions belong to one model copy, never the next unit bound to the same frame.
+#[test]
+fn unit_model_completion_rejects_previous_bindings_and_clears_when_replaced_by_a_file() {
+    use super::model_clock::pane;
+    use crate::script::{QuadContent, UnitGuids};
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        target: 2,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel", "BoundCopy")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0)
+        p:SetUnit("player")
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    let previous = s.visible_unit_model_panes().remove(0);
+    s.run("p:SetUnit(\"target\") p:SetCamera(0)").unwrap();
+    let current = s.visible_unit_model_panes().remove(0);
+    s.set_unit_model_facts(previous.handle, previous.instance, unit_facts());
+    assert!(pane(&s, "BoundCopy").unit_facts.is_none());
+    s.set_unit_model_facts(current.handle, current.instance, unit_facts());
+    let loaded = pane(&s, "BoundCopy");
+    assert_eq!(loaded.unit_guid, Some(2));
+    assert_eq!(loaded.unit_camera, None);
+    assert_eq!(loaded.camera, Some(1));
+    assert!(!loaded.pending_seed);
+    assert!(s.extract().iter().any(|q| {
+        matches!(
+            &q.content,
+            QuadContent::ModelPane { unit_guid: Some(2), instance, .. }
+                if *instance == current.instance
+        )
+    }));
+    s.run("p:SetModel(\"Creature\\\\Wolf\\\\Wolf.mdx\")")
+        .unwrap();
+    assert!(s.visible_unit_model_panes().is_empty());
+    let file = pane(&s, "BoundCopy");
+    assert!(file.unit_guid.is_none());
+    assert!(file.unit_facts.is_none());
+}
+
+/// Character readiness chooses camera 1 after the base pending request (`0x505b30`).
+#[test]
+fn unit_model_ready_camera_overrides_preload_requests_but_preserves_later_set_camera() {
+    use super::model_clock::pane;
+    use crate::script::UnitGuids;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel", "ReadyCamera")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0)
+        p:SetUnit("player") p:SetCamera(0)
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    let loading = s.visible_unit_model_panes().remove(0);
+    assert_eq!(pane(&s, "ReadyCamera").camera_pending, Some(0));
+    s.set_unit_model_facts(loading.handle, loading.instance, unit_facts());
+    let ready = pane(&s, "ReadyCamera");
+    assert_eq!(ready.unit_camera, None);
+    assert_eq!(ready.camera, Some(1));
+    assert_eq!(ready.camera_pending, None);
+
+    s.run("p:SetCamera(0)").unwrap();
+    s.set_unit_model_facts(loading.handle, loading.instance, unit_facts());
+    let explicit = pane(&s, "ReadyCamera");
+    assert_eq!(explicit.unit_camera, Some(0));
+    assert_eq!(explicit.camera, Some(0));
+    assert_eq!(explicit.camera_pending, None);
+
+    s.run("p:RefreshUnit() p:SetCamera(0)").unwrap();
+    let rebound = s.visible_unit_model_panes().remove(0);
+    let mut no_cameras = unit_facts();
+    no_cameras.cameras = 0;
+    s.set_unit_model_facts(rebound.handle, rebound.instance, no_cameras);
+    let fallback = pane(&s, "ReadyCamera");
+    assert_eq!(fallback.unit_camera, None);
+    assert_eq!(fallback.camera, None);
+    assert_eq!(fallback.camera_pending, None);
+}
+
+/// A replacement model of the same GUID gets its own ready hook and fresh Stand copy.
+#[test]
+fn replacing_a_same_guid_model_resets_the_old_camera_and_animation_arm() {
+    use super::model_clock::pane;
+    use crate::script::UnitGuids;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel", "TransformedCopy")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0) p:SetUnit("player")
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    let copy = s.visible_unit_model_panes().remove(0);
+    s.set_unit_model_facts(copy.handle, copy.instance, unit_facts());
+    s.tick(0.2);
+    for camera_count in [2, 0] {
+        s.run("p:SetCamera(0) p:SetSequenceTime(0, 375)").unwrap();
+        let old = pane(&s, "TransformedCopy");
+        assert_eq!(old.unit_camera, Some(0));
+        assert_eq!(
+            old.play_head(old.unit_facts.as_deref().unwrap())
+                .unwrap()
+                .cursor_ms,
+            375
+        );
+        s.set_unit_model_present(copy.handle, copy.instance, false);
+        let released = pane(&s, "TransformedCopy");
+        assert_eq!(released.unit_guid, Some(1));
+        assert_eq!(released.instance, copy.instance);
+        assert!(!released.unit_model_present);
+        assert!(released.unit_facts.is_none());
+        assert!(released.armed.is_none());
+        let mut replacement = unit_facts();
+        replacement.cameras = camera_count;
+        s.set_unit_model_facts(copy.handle, copy.instance, replacement.clone());
+        let ready = pane(&s, "TransformedCopy");
+        assert!(ready.unit_model_present);
+        assert_eq!(ready.unit_camera, None);
+        assert_eq!(ready.camera, (camera_count > 1).then_some(1));
+        assert_eq!(ready.armed.unwrap().anim_id, 0);
+        assert_eq!(ready.play_head(&replacement).unwrap().cursor_ms, 0);
+    }
+}
+
+/// A size-less pane must load before its model bounds can supply its geometry (`0x76d080`).
+#[test]
+fn unit_model_bounds_complete_implicit_geometry_without_bootstrap_deadlock() {
+    use crate::script::UnitGuids;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        ..Default::default()
+    });
+    s.run(r#"p = CreateFrame("PlayerModel") p:SetPoint("CENTER", 0, 0) p:SetUnit("player")"#)
+        .unwrap();
+    s.resolve();
+    let loading = s.visible_unit_model_panes().remove(0);
+    assert_eq!(loading.rect.width(), 0.0);
+    assert_eq!(loading.rect.height(), 0.0);
+    s.set_unit_model_facts(loading.handle, loading.instance, unit_facts());
+    s.resolve();
+    let ready = s.visible_unit_model_panes().remove(0);
+    assert!(ready.rect.width() > 0.0);
+    assert!(ready.rect.height() > 0.0);
+    s.run("p:SetWidth(30) p:SetHeight(40)").unwrap();
+    s.set_unit_model_facts(ready.handle, ready.instance, unit_facts());
+    s.resolve();
+    let authored = s.visible_unit_model_panes().remove(0);
+    assert!((authored.rect.width() - 30.0).abs() < 0.001);
+    assert!((authored.rect.height() - 40.0).abs() < 0.001);
+}
+
+/// Unit copies use the pane clock and character completion, without firing Model's Lua callback.
+#[test]
+fn unit_model_clock_and_paint_pause_when_hidden_and_rearm_native_stand() {
+    use super::model_clock::pane;
+    use crate::script::UnitGuids;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel", "LiveCopy")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0) p:SetUnit("player")
+        PAINTS = 0 FINISHES = 0
+        p:SetScript("OnUpdateModel", function() PAINTS = PAINTS + 1 end)
+        p:SetScript("OnAnimFinished", function() FINISHES = FINISHES + 1 end)
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    let loading = s.visible_unit_model_panes().remove(0);
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 0);
+    s.set_unit_model_present(loading.handle, loading.instance + 1, true);
+    assert!(!pane(&s, "LiveCopy").unit_model_present);
+    s.set_unit_model_present(loading.handle, loading.instance, true);
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 1);
+    s.set_unit_model_facts(loading.handle, loading.instance, unit_facts());
+    s.tick(0.25);
+    let visible = pane(&s, "LiveCopy");
+    assert_eq!(visible.clock_ms, 450);
+    assert_eq!(visible.play_head(&unit_facts()).unwrap().cursor_ms, 250);
+    s.run("p:Hide()").unwrap();
+    s.tick(0.5);
+    assert_eq!(pane(&s, "LiveCopy").clock_ms, 450);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 2);
+    assert!(s.visible_unit_model_panes().is_empty());
+    assert!(!pane(&s, "LiveCopy").unit_model_present);
+    s.run("p:Show()").unwrap();
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 2);
+    s.set_unit_model_facts(loading.handle, loading.instance, unit_facts());
+    s.run("p:SetRotation(1) p:SetRotation(1)").unwrap();
+    s.tick(1.0);
+    assert_eq!(s.eval::<u32>("return FINISHES").unwrap(), 0);
+    assert_eq!(pane(&s, "LiveCopy").armed.unwrap().anim_id, 0);
+}
+
+/// A GUID for an out-of-range party member cannot stand in for a model pointer (`0x76d24c`).
+#[test]
+fn unavailable_unit_model_has_no_paint_hook_until_a_copy_is_allocated() {
+    use crate::script::UnitGuids;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        party: [7, 0, 0, 0],
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0) p:SetUnit("party1")
+        PAINTS = 0
+        p:SetScript("OnUpdateModel", function() PAINTS = PAINTS + 1 end)
+        "#,
+    )
+    .unwrap();
+    s.tick(0.1);
+    let loading = s.visible_unit_model_panes().remove(0);
+    assert_eq!(loading.guid, 7);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 0);
+    s.set_unit_model_present(loading.handle, loading.instance, true);
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 1);
+    s.set_unit_model_present(loading.handle, loading.instance, false);
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 1);
+    s.run("p:SetUnit(nil)").unwrap();
+    s.set_unit_model_present(loading.handle, loading.instance, true);
+    s.tick(0.1);
+    assert_eq!(s.eval::<u32>("return PAINTS").unwrap(), 1);
+}
+
+/// The native turn latch uses UI time and stops non-Stand arms only outside the held turn.
+#[test]
+fn unit_model_turn_latch_and_stand_scrubbing_reach_the_host_play_head() {
+    use crate::script::UnitGuids;
+    use crate::widget::SequenceFacts;
+
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_unit_guids(&UnitGuids {
+        player: 1,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        p = CreateFrame("PlayerModel")
+        p:SetWidth(90) p:SetHeight(90) p:SetPoint("CENTER", 0, 0) p:SetUnit("player")
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    let pane = s.visible_unit_model_panes().remove(0);
+    let mut facts = unit_facts();
+    for anim_id in [11, 12, 26] {
+        facts.sequences.push(SequenceFacts {
+            anim_id,
+            duration_ms: 1000,
+            looping: true,
+        });
+    }
+    s.set_unit_model_facts(pane.handle, pane.instance, facts.clone());
+    s.run("p:SetRotation(1)").unwrap();
+    let right = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(right.armed.unwrap().anim_id, 12);
+    s.tick(0.05);
+    let held = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(held.armed.unwrap().anim_id, 12);
+    s.tick(0.06);
+    let stopped = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(stopped.armed.unwrap().anim_id, 0);
+    s.run("p:SetSequenceTime(0, 375)").unwrap();
+    let scrub = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(scrub.play_head(&facts).unwrap().cursor_ms, 375);
+    s.run("p:SetSequence(26)").unwrap();
+    let reset = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(reset.armed.unwrap().anim_id, 0);
+    s.run("p:SetRotation(-1)").unwrap();
+    let left = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(left.armed.unwrap().anim_id, 11);
+    s.run("p:SetRotation(-1)").unwrap();
+    let equal = s
+        .prepare_unit_model_paint(pane.handle, pane.instance)
+        .unwrap();
+    assert_eq!(equal.armed.unwrap().anim_id, 0);
 }

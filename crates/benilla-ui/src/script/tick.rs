@@ -247,12 +247,20 @@ impl UiScript {
                 return;
             };
             m.clock_ms += dt_ms;
-            let facts = m
-                .path
-                .as_deref()
-                .and_then(|p| model.model_facts.get(&crate::widget::model_key(p)));
+            let facts = m.unit_facts.clone().or_else(|| {
+                m.path
+                    .as_deref()
+                    .and_then(|p| model.model_facts.get(&crate::widget::model_key(p)))
+                    .cloned()
+            });
             match facts {
-                Some(facts) if dt_ms > 0 && m.completion_due(facts) => {
+                Some(facts) if dt_ms > 0 && m.completion_due(&facts) => {
+                    if m.unit_guid.is_some() {
+                        // A unit copy installs the character callback, which re-arms Stand
+                        // (`0x5062a0`), instead of Model's Lua `OnAnimFinished` callback.
+                        m.arm(0, 0, Some(&facts));
+                        return;
+                    }
                     if let Some(a) = &mut m.armed {
                         a.finished = true;
                     }
@@ -335,7 +343,7 @@ impl UiScript {
 /// layer emit and its render callback both require (`0x76d24c`); on any other kind
 /// `OnUpdateModel` is inert.
 fn has_model_file(f: &crate::widget::Frame) -> bool {
-    matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.path.is_some())
+    matches!(&f.kind_state, crate::widget::KindState::Model(m) if m.path.is_some() || m.unit_model_present)
 }
 
 /// The paint callback's gates ahead of `OnUpdateModel` (`0x76d240`, firing at `0x76d5ea`): a model

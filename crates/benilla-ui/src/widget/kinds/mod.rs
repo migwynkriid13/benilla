@@ -314,6 +314,19 @@ pub struct ModelState {
     pub path: Option<String>,
     /// `PlayerModel:SetUnit`'s unit (`0x505d70`); it and [`Self::path`] each clear the other.
     pub unit: Option<String>,
+    /// The GUID captured by `SetUnit` (`0x505b50`), kept until another bind or clear.
+    pub unit_guid: Option<u64>,
+    /// The host has allocated a copy of the held unit's model, including one still streaming.
+    /// A GUID by itself is not the reference's model pointer (`0x76d24c`).
+    pub unit_model_present: bool,
+    /// The unit copy's resident file facts; absent while that instance is streaming.
+    pub unit_facts: Option<std::sync::Arc<ModelFileFacts>>,
+    /// An explicit `SetCamera` on the unit copy; none uses the character-pane ready camera.
+    pub unit_camera: Option<i32>,
+    /// `SetRotation` was called since the last paint (`+0x3e8`).
+    pub unit_turn_latched: bool,
+    /// The native UI clock deadline in ms (`+0x3ec`), refreshed to now + 100 by a rotation.
+    pub unit_turn_until_ms: u64,
     /// The last `SetSequence` id (`[bone0 block + 0xf8]`); what plays is [`Self::armed`].
     pub sequence: i32,
     /// The pane's own scene clock in ms (`0x76cfc0`): its `OnUpdate` (`0x76d7f0`) adds
@@ -364,9 +377,8 @@ pub struct ModelState {
     /// (`0x76cd96` → `0x76d680`): the scene draws unfogged whatever the fog fields hold. The
     /// callback rides the model instance, so the next `SetModel` or `ClearModel` drops it.
     pub select_fill: bool,
-    /// The number of the instance the last `SetModel` made: `0x76cce0` builds a new one on every
-    /// call (`0x76ccf5`-`0x76cd0d`), its scene starting over, even for the file it held. 0 for
-    /// none.
+    /// The model-copy generation: `SetModel` (`0x76cce0`) and a unit rebuild (`0x5059a0`) make
+    /// new instances, even for the same subject. 0 for none; the host qualifies it by VM session.
     pub instance: u64,
 }
 
@@ -425,6 +437,12 @@ impl Default for ModelState {
         Self {
             path: None,
             unit: None,
+            unit_guid: None,
+            unit_model_present: false,
+            unit_facts: None,
+            unit_camera: None,
+            unit_turn_latched: false,
+            unit_turn_until_ms: 0,
             sequence: 0,
             clock_ms: 0,
             armed: None,
@@ -543,6 +561,12 @@ impl ModelState {
     pub fn set_file(&mut self, path: String, facts: Option<&ModelFileFacts>) {
         self.path = Some(path);
         self.unit = None;
+        self.unit_guid = None;
+        self.unit_model_present = false;
+        self.unit_facts = None;
+        self.unit_camera = None;
+        self.unit_turn_latched = false;
+        self.unit_turn_until_ms = 0;
         self.icon = None;
         self.armed = None;
         self.pending_seed = true;
@@ -556,10 +580,29 @@ impl ModelState {
     pub fn clear_file(&mut self) {
         self.path = None;
         self.unit = None;
+        self.unit_guid = None;
+        self.unit_model_present = false;
+        self.unit_facts = None;
+        self.unit_camera = None;
         self.icon = None;
         self.armed = None;
         self.pending_seed = false;
         self.select_fill = false;
+        self.instance = 0;
+        self.unit_turn_latched = false;
+        self.unit_turn_until_ms = 0;
+    }
+
+    /// A character pane's hide hook releases its copy, retaining the bound GUID (`0x505ce0`).
+    pub(crate) fn release_unit_copy(&mut self) {
+        self.unit_model_present = false;
+        self.unit_facts = None;
+        self.unit_camera = None;
+        self.camera_pending = Some(1);
+        self.armed = None;
+        self.pending_seed = self.unit_guid.is_some();
+        self.unit_turn_latched = false;
+        self.unit_turn_until_ms = 0;
     }
 
     /// `SetSequence`/`SetSequenceTime` (`0x7121a0`): interrupts what plays, with no

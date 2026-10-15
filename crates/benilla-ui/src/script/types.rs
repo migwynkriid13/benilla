@@ -65,12 +65,16 @@ pub enum QuadContent {
         /// The indoor zoom index (`0x86f69c`), sent too so the renderer picks by its own test.
         inside_zoom: u8,
     },
-    /// A `Model` or `PlayerModel` widget's 3D pane: a `model` file draws as a tile, a unit pane
-    /// samples the bake of the window its name belongs to, or nothing. The host memoizes on this
+    /// A `Model` or `PlayerModel` widget's 3D pane: a file or a copy of the bound unit's model.
+    /// Anonymous panes have the same per-frame identity as named ones. The host memoizes on this
     /// list, so it reads the moving play head from `UiScript::visible_model_panes` instead.
     ModelPane {
         /// The renderer's key for the tile it keeps per pane.
         handle: crate::widget::FrameHandle,
+        /// The model-copy generation, qualified by `UiScript::session` at the host.
+        instance: u64,
+        /// The unit GUID captured at `SetUnit`, not a token re-resolved by the renderer.
+        unit_guid: Option<u64>,
         /// The global frame name; `None` for an anonymous `CreateFrame("Model")`.
         name: Option<String>,
         /// The `SetModel` file; `None` for a unit pane or an empty one.

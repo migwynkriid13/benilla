@@ -1145,12 +1145,13 @@ fn convert_entry(
         }
         // A `<Model>`/`<PlayerModel>` pane draws itself, as the stock files declare a bare pane
         // with no Texture: a glue `ModelFFX` is the glue booth's scene, a file pane is a model
-        // tile, a unit pane samples its window's body bake square
-        // ([`crate::portrait::model_pane_booth`]), and an unclaimed pane draws nothing.
+        // tile, and a unit pane samples its own dressed copy or a stock window's body booth.
         QuadContent::ModelPane {
             handle,
             name,
             model,
+            unit_guid,
+            instance,
             facing,
             model_scale,
             position,
@@ -1254,7 +1255,14 @@ fn convert_entry(
                 }
                 return;
             }
-            let Some(slot) = name.as_deref().and_then(crate::portrait::model_pane_booth) else {
+            let stock_slot = name.as_deref().and_then(crate::portrait::model_pane_booth);
+            let generic_slot;
+            let slot = if let Some(slot) = stock_slot {
+                slot
+            } else if unit_guid.is_some() {
+                generic_slot = crate::portrait::unit_pane_slot(handle, instance);
+                generic_slot.as_str()
+            } else {
                 return;
             };
             // The aspect is published before the readiness check: the bake waits on the publish.
@@ -1280,7 +1288,16 @@ fn convert_entry(
                 rect,
                 z_key: eq.z,
                 texture: Some(handle),
-                color: [1.0, 1.0, 1.0, eq.alpha],
+                color: [
+                    1.0,
+                    1.0,
+                    1.0,
+                    if stock_slot.is_some() {
+                        eq.alpha
+                    } else {
+                        own_alpha
+                    },
+                ],
                 premultiplied,
                 clip,
                 ..default()
@@ -2197,7 +2214,7 @@ mod extract_gate_tests {
     }
 
     /// `PaperDollFrame.xml:204` declares a bare `<PlayerModel name="CharacterModelFrame">`; a pane
-    /// no window claims ([`crate::portrait::model_pane_booth`]) must not borrow a bake.
+    /// no window claims must not borrow that window's bake.
     #[test]
     fn a_named_model_pane_samples_its_booth_and_an_unclaimed_one_draws_nothing() {
         let mut app = app_from_script(
@@ -2246,6 +2263,84 @@ mod extract_gate_tests {
         assert!(
             (aspect - 233.0 / 224.0).abs() < 0.01,
             "the pane's own rect is the aspect, got {aspect}"
+        );
+    }
+
+    #[test]
+    fn named_and_anonymous_unit_panes_draw_their_own_images_and_drop_a_rebound_subject() {
+        let mut script = UiScript::new().unwrap();
+        script.set_unit_guids(&benilla_ui::script::UnitGuids {
+            player: 1,
+            target: 2,
+            held: std::collections::HashMap::from([(1, 0), (2, 0)]),
+            ..Default::default()
+        });
+        script
+            .run(
+                r#"
+            first = CreateFrame("PlayerModel", "NamedUnitCopy")
+            first:SetPoint("TOPLEFT", 0, 0); first:SetWidth(62); first:SetHeight(62)
+            first:SetUnit("player"); first:SetAlpha(0.6)
+            second = CreateFrame("PlayerModel")
+            second:SetPoint("TOPLEFT", 100, 0); second:SetWidth(62); second:SetHeight(62)
+            second:SetUnit("target")
+        "#,
+            )
+            .unwrap();
+        script.resolve();
+        let panes = script.visible_unit_model_panes();
+        assert_eq!(panes.len(), 2);
+        let mut app = app_over(script);
+        let images: Vec<_> = (0..2)
+            .map(|_| {
+                app.world_mut()
+                    .resource_mut::<Assets<Image>>()
+                    .add(Image::default())
+            })
+            .collect();
+        for (pane, image) in panes.iter().zip(&images) {
+            app.world_mut().resource_mut::<PortraitImages>().0.insert(
+                crate::portrait::unit_pane_slot(pane.handle, pane.instance),
+                crate::portrait::PortraitSource::Live(image.clone()),
+            );
+        }
+        app.update();
+        for image in &images {
+            let matches: Vec<_> = app
+                .world()
+                .resource::<UiQuads>()
+                .quads
+                .iter()
+                .filter(|quad| quad.texture.as_ref() == Some(image))
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert!(matches[0].premultiplied);
+            assert!(
+                !matches[0].circular,
+                "PlayerModel is the rectangular native viewport"
+            );
+        }
+        let alpha = app
+            .world()
+            .resource::<UiQuads>()
+            .quads
+            .iter()
+            .find(|quad| quad.texture.as_ref() == Some(&images[0]))
+            .unwrap()
+            .color[3];
+        assert!((alpha - 0.6).abs() < 1.0e-5);
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run("second:SetUnit('player')")
+            .unwrap();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<UiQuads>()
+                .quads
+                .iter()
+                .all(|quad| quad.texture.as_ref() != Some(&images[1])),
+            "the previous target image must not survive a new binding revision"
         );
     }
 

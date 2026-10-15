@@ -52,7 +52,9 @@ use booth::{
     BoothBillboardSpec, BoothEffects, BoothInstance, BoothMotion, BoothPart, BoothRider,
 };
 mod dressup;
+mod unit_panes;
 pub(crate) use dressup::{DressUpBake, DressUpLook, DressUpPreview};
+pub(crate) use unit_panes::unit_pane_slot;
 mod glue_booth;
 /// A model file's own authored lights, folded as the reference's gather does (`0x718960`).
 pub(crate) use glue_booth::{scene_rig, SceneRig};
@@ -99,7 +101,7 @@ const STABLE_SLOT: &str = "stable";
 /// Which booth a `<Model>`/`<PlayerModel>` pane samples, keyed by the pane's global name from the
 /// stock file (`PaperDollFrame.xml`, `TabardFrame.xml`, `PetPaperDollFrame.xml`,
 /// `InspectPaperDollFrame.xml`, `PetStable.xml`, `DressUpFrame.xml`,
-/// `Blizzard_AuctionDressUp.xml`). A pane not in this table draws nothing.
+/// `Blizzard_AuctionDressUp.xml`). Other unit panes have a booth of their own, keyed by handle.
 const MODEL_PANE_BOOTHS: [(&str, &str); 7] = [
     ("CharacterModelFrame", PAPERDOLL_SLOT),
     // The tabard designer's pane: the paper doll's bake, wearing the design under preview.
@@ -783,7 +785,17 @@ impl Plugin for PortraitPlugin {
             .init_resource::<BoothPanes>()
             .init_resource::<GxAspect>()
             .init_resource::<BoothLight>()
+            .init_resource::<unit_panes::UnitPanes>()
             .add_systems(Startup, setup_booths)
+            .add_systems(
+                Update,
+                (unit_panes::sync_unit_panes, unit_panes::sample_unit_panes)
+                    .chain()
+                    .after(crate::ui_script::UiInput)
+                    .after(sync_stable_booth)
+                    .before(booth::drive_booth_turn)
+                    .before(crate::ui_script::UiPaint),
+            )
             // The variant-cache reaper: booth twins die with their world source material.
             .add_systems(Update, (light::reap_dead_variants, feed_gx_aspect))
             // The test bake owns the booths when its env is set; the chain orders the shared

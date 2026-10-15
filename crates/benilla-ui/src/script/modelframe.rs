@@ -75,14 +75,33 @@ impl Model {
 
     /// `SetCamera(idx)` on the pane `h` (`0x76cec0`), against the facts of the file it holds.
     pub(crate) fn set_pane_camera(&mut self, h: FrameHandle, idx: i32) {
-        let path = match self.arena.frame(h).map(|f| &f.kind_state) {
-            Some(KindState::Model(m)) => m.path.clone(),
+        let (path, unit_facts) = match self.arena.frame(h).map(|f| &f.kind_state) {
+            Some(KindState::Model(m)) => (m.path.clone(), m.unit_facts.clone()),
             _ => return,
         };
-        let facts = path.and_then(|p| self.model_facts_for(&p));
+        let facts = unit_facts.or_else(|| path.and_then(|p| self.model_facts_for(&p)));
         if let Some(KindState::Model(m)) = self.arena.frame_mut(h).map(|f| &mut f.kind_state) {
+            if m.unit.is_some() {
+                m.unit_camera = Some(idx);
+            }
             m.install_camera(idx, facts.as_deref());
         }
+    }
+
+    /// A character pane stores the GUID, then builds its own model copy (`0x505b50`).
+    fn bind_pane_unit(&mut self, h: FrameHandle, unit: Option<String>, guid: Option<u64>) {
+        let instance = self.model_instances + 1;
+        let Some(KindState::Model(m)) = self.arena.frame_mut(h).map(|f| &mut f.kind_state) else {
+            return;
+        };
+        m.clear_file();
+        m.unit = unit;
+        m.unit_guid = guid;
+        m.instance = if guid.is_some() { instance } else { 0 };
+        m.pending_seed = guid.is_some();
+        m.camera_pending = Some(1);
+        m.camera = None;
+        self.model_instances = instance;
     }
 
     /// The implicit rect: a pane with no authored size takes its file's bounding-box extent, in
@@ -94,10 +113,12 @@ impl Model {
             let KindState::Model(m) = &f.kind_state else {
                 return;
             };
-            let Some(path) = m.path.as_deref() else {
-                return;
-            };
-            let Some(facts) = self.model_facts.get(&model_key(path)) else {
+            let facts = m.unit_facts.as_ref().or_else(|| {
+                m.path
+                    .as_deref()
+                    .and_then(|path| self.model_facts.get(&model_key(path)))
+            });
+            let Some(facts) = facts else {
                 return;
             };
             let authored = !m.implicit_size
@@ -148,11 +169,13 @@ impl Model {
 
 /// The facts of the file `this` pane holds, if it holds one the host has loaded.
 fn facts_of_pane(lua: &Lua, this: &Table) -> mlua::Result<Option<Arc<ModelFileFacts>>> {
-    let path = with_model(lua, this, |m| m.path.clone())?;
-    Ok(path.and_then(|p| {
-        lua.app_data_mut::<Model>()
-            .expect("model app_data")
-            .model_facts_for(&p)
+    let (path, unit_facts) = with_model(lua, this, |m| (m.path.clone(), m.unit_facts.clone()))?;
+    Ok(unit_facts.or_else(|| {
+        path.and_then(|p| {
+            lua.app_data_mut::<Model>()
+                .expect("model app_data")
+                .model_facts_for(&p)
+        })
     }))
 }
 
@@ -547,7 +570,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             };
             let path = path.to_string();
             with_model(lua, &this, |m| {
-                if m.path.is_some() {
+                if m.path.is_some() || m.unit_guid.is_some() {
                     m.icon = Some(path);
                 }
             })
@@ -563,8 +586,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 pub(super) fn install_player_model(lua: &Lua) -> mlua::Result<()> {
     let m = lua.create_table()?;
 
-    // `SetUnit(unit)` (`0x84f1fc[0]` → `0x505d70`) clears the `SetModel` path; the unit token is
-    // resolved at render.
+    // `SetUnit(unit)` stores the resolved GUID, not a token to follow later (`0x505b50`).
     m.set(
         "SetUnit",
         lua.create_function(|lua, (this, unit): (Table, Value)| {
@@ -572,28 +594,37 @@ pub(super) fn install_player_model(lua: &Lua) -> mlua::Result<()> {
                 Value::String(s) => Some(s.to_str()?.to_string()),
                 _ => None,
             };
-            with_model(lua, &this, |m| {
-                m.unit = unit;
-                m.path = None;
-            })?;
+            with_model(lua, &this, |_| ())?;
+            let h = frame_handle_of(lua, &this)?;
+            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            let guid = unit
+                .as_deref()
+                .map(|u| model.unit_guids.guid_of(u))
+                .transpose()?
+                .flatten();
+            model.bind_pane_unit(h, unit, guid);
+            drop(model);
             // A dress-up pane rebuilds from the unit's live model, dropping try-ons (`0x5059a0`).
             super::dressup::redress_if_dressup(lua, &this)
         })?,
     )?;
 
-    // `RefreshUnit()` (`0x84f1fc[1]` → `0x505e40`) re-reads the pane's unit; the token already
-    // resolves at render, so only a dress-up pane has work to do.
+    // `RefreshUnit()` rebuilds the copy of the stored GUID (`0x505e40`, `0x5059a0`).
     m.set(
         "RefreshUnit",
         lua.create_function(|lua, this: Table| {
-            with_model(lua, &this, |_| ())?;
+            let (unit, guid) = with_model(lua, &this, |m| (m.unit.clone(), m.unit_guid))?;
+            let h = frame_handle_of(lua, &this)?;
+            lua.app_data_mut::<Model>()
+                .expect("model app_data")
+                .bind_pane_unit(h, unit, guid);
             // The same worker as `SetUnit`'s (`0x505b50`).
             super::dressup::redress_if_dressup(lua, &this)
         })?,
     )?;
 
     // `SetRotation(rad)` (`0x84f1fc[2]` → `0x505f00` → `0x505bb0`) writes the yaw `SetFacing`
-    // writes (`0x505c44`). Not built: the reference also plays a turn animation, ShuffleRight
+    // writes (`0x505c44`). The host tracks each call for the turn animation, ShuffleRight
     // (`0xc`) when the facing grows, ShuffleLeft (`0xb`) when it shrinks, else Stand (0), unless
     // already armed on bone slot 0, and holds the turn 100 ms (`[+0x3e8]`, `[+0x3ec]`, expired by
     // `0x505c50`).
@@ -601,7 +632,27 @@ pub(super) fn install_player_model(lua: &Lua) -> mlua::Result<()> {
         "SetRotation",
         lua.create_function(|lua, (this, rad): (Table, Value)| {
             let rad = num(&rad);
-            with_model(lua, &this, |m| m.facing = rad)
+            let now_ms =
+                (lua.app_data_ref::<Model>().expect("model app_data").now * 1000.0).max(0.0) as u64;
+            with_model(lua, &this, |m| {
+                if m.unit_model_present {
+                    if let Some(facts) = m.unit_facts.clone() {
+                        let id = if m.facing < rad {
+                            12
+                        } else if m.facing > rad {
+                            11
+                        } else {
+                            0
+                        };
+                        if m.armed.is_none_or(|a| a.anim_id != id) {
+                            m.arm(id, 0, Some(&facts));
+                        }
+                    }
+                }
+                m.unit_turn_latched = true;
+                m.unit_turn_until_ms = now_ms.saturating_add(100);
+                m.facing = rad;
+            })
         })?,
     )?;
 
@@ -609,6 +660,136 @@ pub(super) fn install_player_model(lua: &Lua) -> mlua::Result<()> {
 }
 
 impl crate::script::UiScript {
+    /// Publish allocation independently from residency: a stored unit GUID alone is not a copy.
+    pub fn set_unit_model_present(&mut self, handle: FrameHandle, instance: u64, present: bool) {
+        let mut model = self.model_mut();
+        let Some(frame) = model.arena.frame_mut(handle) else {
+            return;
+        };
+        let KindState::Model(m) = &mut frame.kind_state else {
+            return;
+        };
+        if m.instance != instance || m.unit_guid.is_none() || m.path.is_some() {
+            return;
+        }
+        if present && frame.effective_visible {
+            m.unit_model_present = true;
+        } else {
+            m.release_unit_copy();
+        }
+    }
+
+    /// The character pane's per-paint turn latch and Stand reset (`0x505c50`), after Lua's hook.
+    pub fn prepare_unit_model_paint(
+        &mut self,
+        handle: FrameHandle,
+        instance: u64,
+    ) -> Option<ModelState> {
+        let mut model = self.model_mut();
+        let now_ms = (model.now * 1000.0).max(0.0) as u64;
+        let frame = model.arena.frame_mut(handle)?;
+        if !frame.effective_visible {
+            return None;
+        }
+        let KindState::Model(m) = &mut frame.kind_state else {
+            return None;
+        };
+        if m.instance != instance || !m.unit_model_present || m.unit_guid.is_none() {
+            return None;
+        }
+        if !m.unit_turn_latched && now_ms > m.unit_turn_until_ms {
+            if let Some(facts) = m.unit_facts.clone() {
+                if m.armed.is_some_and(|a| a.anim_id != 0) {
+                    m.arm(0, 0, Some(&facts));
+                }
+            }
+        }
+        m.unit_turn_latched = false;
+        Some(m.clone())
+    }
+
+    /// Visible unit copies, named or anonymous, keyed by this VM's session and frame handle.
+    /// The GUID is the binding captured by `SetUnit`, as the reference stores at `0x505b50`.
+    pub fn visible_unit_model_panes(&self) -> Vec<UnitModelPaneFrame> {
+        let model = self.model_ref();
+        model
+            .arena
+            .model_kinds()
+            .iter()
+            .filter_map(|&handle| {
+                let f = model.arena.frame(handle)?;
+                if !f.effective_visible
+                    || !f.effective_scale.is_finite()
+                    || f.effective_scale <= 0.0
+                {
+                    return None;
+                }
+                let KindState::Model(state) = &f.kind_state else {
+                    return None;
+                };
+                if state.path.is_some() {
+                    return None;
+                }
+                // A size-less copy still needs its file loaded to acquire implicit bounds.
+                let rect = model
+                    .resolved
+                    .get(&handle)
+                    .copied()
+                    .unwrap_or(crate::layout::Rect::new(0.0, 0.0, 0.0, 0.0));
+                if ![rect.left, rect.right, rect.top, rect.bottom]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    return None;
+                }
+                Some(UnitModelPaneFrame {
+                    handle,
+                    name: f.name.clone(),
+                    rect,
+                    scale: f.effective_scale,
+                    unit: state.unit.clone()?,
+                    guid: state.unit_guid?,
+                    instance: state.instance,
+                    state: state.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Complete only the requested unit copy; an async result for a previous bind is discarded.
+    pub fn set_unit_model_facts(
+        &mut self,
+        handle: FrameHandle,
+        instance: u64,
+        facts: ModelFileFacts,
+    ) {
+        let mut model = self.model_mut();
+        let Some(frame) = model.arena.frame_mut(handle) else {
+            return;
+        };
+        if !frame.effective_visible {
+            return;
+        }
+        let KindState::Model(m) = &mut frame.kind_state else {
+            return;
+        };
+        if m.instance != instance || m.unit_guid.is_none() || m.path.is_some() {
+            return;
+        }
+        let facts = Arc::new(facts);
+        let first_ready = m.unit_facts.is_none();
+        m.unit_model_present = true;
+        m.seed_from_facts(&facts);
+        if first_ready {
+            // The character ready hook follows the base pending-camera step with its own
+            // frozen camera 1 or fixed fallback (`0x505b30`, `0x505890`).
+            m.unit_camera = None;
+            m.install_camera(1, Some(&facts));
+        }
+        m.unit_facts = Some(facts);
+        model.apply_implicit_rect(handle);
+    }
+
     /// The scene state of the model pane named `name`, for the host that draws it, which knows the
     /// pane by its stock name (`CharacterModelFrame`).
     pub fn model_pane(&self, name: &str) -> Option<ModelState> {
@@ -726,4 +907,18 @@ pub struct ModelPaneFrame {
     pub clock_ms: u64,
     /// The armed sequence's play head; `None` draws the rest pose.
     pub play: Option<crate::widget::ModelPlayHead>,
+}
+
+/// A unit-backed model copy ready for the host to load or draw, in registry order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnitModelPaneFrame {
+    pub handle: FrameHandle,
+    pub name: Option<String>,
+    /// Zero while a size-less pane waits for file bounds; load it, but do not draw that rect.
+    pub rect: crate::layout::Rect,
+    pub scale: f32,
+    pub unit: String,
+    pub guid: u64,
+    pub instance: u64,
+    pub state: ModelState,
 }

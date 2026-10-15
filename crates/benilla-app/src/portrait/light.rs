@@ -18,6 +18,7 @@ pub(super) struct BoothRig {
     variants: HashMap<AssetId<WowModelMaterial>, Handle<WowModelMaterial>>,
     /// Set by [`Self::variant`] when the source material was not resident yet.
     unready: bool,
+    lane: Option<VariantLane>,
 }
 
 impl BoothRig {
@@ -42,7 +43,7 @@ impl BoothRig {
             &buffer,
             world,
             materials,
-            VariantLane::World,
+            self.lane.unwrap_or(VariantLane::World),
         ) {
             Some(twin) => twin,
             None => {
@@ -71,6 +72,75 @@ impl BoothRig {
 pub(super) struct BoothLight {
     pub(super) studio: BoothRig,
     pub(super) pane: BoothRig,
+}
+
+impl BoothLight {
+    pub(super) fn reap_model_variants(&mut self, materials: &Assets<WowModelMaterial>) {
+        self.pane
+            .variants
+            .retain(|source, _| materials.get(*source).is_some());
+    }
+
+    /// A pane's own light and fog (`0x76d680`), sharing no mutable scene with another widget.
+    pub(super) fn set_model_scene(
+        &mut self,
+        light: benilla_ui::widget::ModelLight,
+        fog: Option<benilla_ui::widget::ModelFog>,
+        device: &bevy::render::renderer::RenderDevice,
+        queue: &bevy::render::renderer::RenderQueue,
+    ) -> bool {
+        let (blob, lane) = model_scene(light, fog);
+        if self.pane.buffer.is_none() {
+            self.pane.buffer = Some(blob.create(device, "wow_unit_model_light"));
+        }
+        if let Some(buffer) = &self.pane.buffer {
+            blob.write(queue, buffer);
+        }
+        let changed = self.pane.lane != Some(lane);
+        if changed {
+            self.pane.variants.clear();
+            self.pane.lane = Some(lane);
+        }
+        changed
+    }
+}
+
+/// `LightingAddLight` (`0x71bf90`): point lights join the nearest-four table; only the other
+/// branch accumulates ambient (`0x71bc70`) and directional SH terms (`0x71bce0`).
+fn model_scene(
+    light: benilla_ui::widget::ModelLight,
+    fog: Option<benilla_ui::widget::ModelFog>,
+) -> (LightBlob, VariantLane) {
+    let (ambient, diffuse, direction) = if light.enabled && !light.omni {
+        (
+            light.ambient,
+            light.diffuse,
+            benilla_assets::coords::wow_to_bevy(light.vector),
+        )
+    } else {
+        ([0.0; 3], [0.0; 3], Vec3::NEG_Y)
+    };
+    let mut blob = LightBlob::model(ambient, diffuse, direction);
+    if light.enabled && light.omni {
+        blob = blob.point(
+            benilla_assets::coords::wow_to_bevy(light.vector),
+            1.0e6,
+            light.diffuse,
+        );
+    }
+    let lane = match fog {
+        Some(f) => {
+            blob = blob.fog_span(f.rgb(), f.near, f.far, true);
+            VariantLane::RigFogged
+        }
+        None => VariantLane::RigUnfogged,
+    };
+    blob = if light.enabled && !light.omni {
+        blob.probe(ambient, &[((-direction).normalize_or_zero(), diffuse)])
+    } else {
+        blob.probe([0.0; 3], &[])
+    };
+    (blob, lane)
 }
 
 /// Reap the booth twins whose world source died (`AssetEvent::Removed`, e.g. a map teardown); a
@@ -182,6 +252,36 @@ pub(super) fn studio_light() -> LightBlob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_point_light_does_not_add_its_ambient_to_the_directional_collector() {
+        let light = benilla_ui::widget::ModelLight {
+            enabled: true,
+            omni: true,
+            vector: [0.0, 0.0, 1.0],
+            ambient: [0.7; 3],
+            diffuse: [0.0; 3],
+        };
+        let (point, _) = model_scene(light, None);
+        assert_eq!(point.point_count(), 1);
+        assert_eq!(
+            point.probe_dc(),
+            [0.0; 3],
+            "the point-light branch never calls 0x71bc70"
+        );
+        let (directional, _) = model_scene(
+            benilla_ui::widget::ModelLight {
+                omni: false,
+                ..light
+            },
+            None,
+        );
+        assert_eq!(directional.point_count(), 0);
+        assert!(directional
+            .probe_dc()
+            .iter()
+            .all(|component| *component > 0.0));
+    }
 
     /// The `CharacterModelBase` ctor's values, and the consequence: the light runs square across
     /// the view axis, so the pane's visible face is ambient-lit only.

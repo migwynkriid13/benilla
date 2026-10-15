@@ -43,6 +43,11 @@ impl WidgetArena {
         match self.frame_mut(h) {
             Some(f) if f.effective_visible => {
                 f.effective_visible = false;
+                if let KindState::Model(m) = &mut f.kind_state {
+                    if m.unit_guid.is_some() {
+                        m.release_unit_copy();
+                    }
+                }
                 true
             }
             _ => false,
