@@ -291,11 +291,17 @@ mod platform {
         {
             extern "C" {
                 fn _putenv_s(name: *const libc::c_char, value: *const libc::c_char) -> libc::c_int;
+                fn __dstbias() -> *mut libc::c_long;
             }
             let tz = std::ffi::CString::new(std::env::var("TZ").unwrap_or_default())
                 .expect("a test zone without NUL");
             // SAFETY: both strings are NUL-terminated, and `_putenv_s` copies their contents.
             assert_eq!(unsafe { _putenv_s(c"TZ".as_ptr(), tz.as_ptr()) }, 0);
+            if !tz.as_bytes().is_empty() {
+                // The CRT's explicit-TZ path retains `_dstbias`; tests use its one-hour US rule.
+                // SAFETY: the accessor returns the CRT's live long; the zone reader is locked.
+                unsafe { *__dstbias() = -3600 };
+            }
         }
         // SAFETY: `_tzset` takes nothing and only reads the zone.
         unsafe { libc::tzset() };
@@ -436,6 +442,33 @@ mod tests {
         reread_zone();
         assert_eq!(local(0).0.hour, 9);
         assert_eq!(zone_name(false), b"JST");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_daylight_zones_do_not_inherit_the_host_bias() {
+        let _zone = ZoneGuard::set("UTC0");
+        extern "C" {
+            fn __dstbias() -> *mut libc::c_long;
+        }
+        // Simulate a host without daylight saving, as restored between guarded test zones.
+        // SAFETY: the accessor returns a live CRT long and this test holds the zone guard.
+        unsafe { *__dstbias() = 0 };
+        let at = 1_000_000_000;
+        for (tz, east, dst) in [
+            ("EST5EDT", -4 * 3600, true),
+            ("NPT-05:45", 5 * 3600 + 45 * 60, false),
+            ("EST5EDT", -4 * 3600, true),
+        ] {
+            std::env::set_var("TZ", tz);
+            reread_zone();
+            assert_eq!(local(at), (from_unix(at + east), dst), "{tz}");
+            assert_eq!(
+                local_seconds((at + east) as i32, dst),
+                Some(at as i32),
+                "{tz} round trip"
+            );
+        }
     }
 
     /// A zone with daylight time: each change of offset found to the second.
